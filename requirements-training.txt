@@ -1,0 +1,9 @@
+# Additional dependencies for training (firstbowel_injury_model.py)
+# Install with: pip install -r requirements-training.txt
+
+# All inference dependencies
+-r requirements.txt
+
+# Training-specific
+pandas>=2.0.0
+scikit-learn>=1.3.0
