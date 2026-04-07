@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "CT Bowel Injury Demo (Streamlit)",
+      "runtimeExecutable": "streamlit",
+      "runtimeArgs": ["run", "last.py", "--server.headless", "true", "--server.maxUploadSize", "500"],
+      "port": 8501
+    },
+    {
+      "name": "CT Bowel Injury Demo (python -m)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "streamlit", "run", "last.py", "--server.headless", "true", "--server.maxUploadSize", "500"],
+      "port": 8501
+    }
+  ]
+}
