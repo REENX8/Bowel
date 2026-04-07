@@ -63,11 +63,3 @@ firstbowel_injury_model.py # Training script
 requirements.txt           # Inference dependencies
 requirements-training.txt  # Training dependencies
 ```
-
-## Team
-
-- ชากีรีน อาแซ
-- อับดุลก็อฟฟาร์ นุ้ยดำ
-
-**อาจารย์ที่ปรึกษา:** อารฝัน บากา
-**โรงเรียน:** วิทยาศาสตร์จุฬาภรณราชวิทยาลัย สตูล
