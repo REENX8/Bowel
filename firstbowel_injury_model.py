@@ -40,6 +40,7 @@ adapt the architecture, hyperparameters, or add augmentation as needed.
 from __future__ import annotations
 
 import os
+import csv
 import math
 import argparse
 from typing import List, Tuple
@@ -267,75 +268,207 @@ def prepare_splits(data_dir: str, n_splits: int = 5) -> Tuple[List[pd.DataFrame]
     return train_folds, val_folds
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description='Train a 2.5D bowel injury classifier on processed CT volumes.')
-    parser.add_argument('--data-dir', type=str, required=True, help='Directory containing .npy volumes and labels.csv')
-    parser.add_argument('--batch-size', type=int, default=2, help='Batch size for training and evaluation')
-    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
-    parser.add_argument('--patience', type=int, default=7, help='Early stopping patience based on Val F1(pos)')
-    parser.add_argument('--min-delta', type=float, default=0.001, help='Minimum improvement in Val F1(pos) to reset patience')
-    parser.add_argument('--n-splits', type=int, default=5, help='Number of folds for GroupKFold cross-validation')
-    parser.add_argument('--num-steps', type=int, default=32, help='Number of time steps (frames) per case')
-    parser.add_argument('--num-slices-per-step', type=int, default=3, help='Number of adjacent slices per frame')
-    parser.add_argument('--cnn-name', type=str, default='resnet18', choices=['resnet18', 'efficientnet_b0'], help='Backbone CNN architecture')
-    parser.add_argument('--hidden-size', type=int, default=256, help='Hidden size of the GRU')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Training device (cuda or cpu)')
-    args = parser.parse_args()
+def _gaussian_noise(img: torch.Tensor, sigma: float = 0.02) -> torch.Tensor:
+    return torch.clamp(img + torch.randn_like(img) * sigma, 0.0, 1.0)
 
-    # Reproducibility
-    torch.manual_seed(42)
-    np.random.seed(42)
 
-    device = torch.device(args.device)
-    train_folds, val_folds = prepare_splits(args.data_dir, n_splits=args.n_splits)
-    # Use the first fold only for simplicity
-    train_df = train_folds[0]
-    val_df = val_folds[0]
-    print(f"Training cases: {len(train_df)}, validation cases: {len(val_df)}")
-
-    # Normalize each frame to [0, 1] during loading
-    transform = transforms.Compose([
-        transforms.Lambda(lambda img: (img - img.min()) / (img.max() - img.min() + 1e-5)),
+def _train_transforms() -> transforms.Compose:
+    """Augmentation pipeline applied per-frame during training."""
+    return transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.Lambda(_gaussian_noise),
+        transforms.Lambda(lambda img: torch.clamp((img - img.min()) / (img.max() - img.min() + 1e-5), 0.0, 1.0)),
     ])
 
-    train_dataset = BowelInjuryDataset(train_df, num_steps=args.num_steps, num_slices_per_step=args.num_slices_per_step, transform=transform)
-    val_dataset = BowelInjuryDataset(val_df, num_steps=args.num_steps, num_slices_per_step=args.num_slices_per_step, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+def _val_transforms() -> transforms.Compose:
+    """Deterministic normalisation only — no augmentation."""
+    return transforms.Compose([
+        transforms.Lambda(lambda img: torch.clamp((img - img.min()) / (img.max() - img.min() + 1e-5), 0.0, 1.0)),
+    ])
+
+
+def _train_fold(
+    fold: int,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    args: argparse.Namespace,
+    device: torch.device,
+    log_writer: csv.DictWriter | None,
+) -> dict:
+    """Train one cross-validation fold and return best metrics."""
+    print(f"\n{'=' * 60}")
+    print(f"FOLD {fold + 1}  |  train={len(train_df)}  val={len(val_df)}")
+    print("=" * 60)
+
+    train_dataset = BowelInjuryDataset(
+        train_df, num_steps=args.num_steps,
+        num_slices_per_step=args.num_slices_per_step,
+        transform=_train_transforms(),
+    )
+    val_dataset = BowelInjuryDataset(
+        val_df, num_steps=args.num_steps,
+        num_slices_per_step=args.num_slices_per_step,
+        transform=_val_transforms(),
+    )
+
+    num_workers = min(2, os.cpu_count() or 1)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     model = CNNGRUClassifier(cnn_name=args.cnn_name, hidden_size=args.hidden_size).to(device)
-    # class imbalance handling
+
     num_pos = int(train_df["bowel_injury"].sum())
     num_neg = int(len(train_df) - num_pos)
-    pw = num_neg / max(num_pos, 1)
-    pw = max(5.0, min(pw, 20.0))  # clamp
+    pw = max(5.0, min(num_neg / max(num_pos, 1), 20.0))
     pos_weight = torch.tensor([pw], device=device)
-    print(f"pos_weight = {pos_weight.item():.2f}  (neg={num_neg}, pos={num_pos})")
+    print(f"pos_weight={pos_weight.item():.2f}  (neg={num_neg}, pos={num_pos})")
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-6, verbose=True
+    )
 
     best_f1 = 0.0
-    epochs_no_improve = 0
+    best_metrics: dict = {}
     best_epoch = 0
+    epochs_no_improve = 0
+    model_save_path = os.path.join(args.data_dir, f"best_bowel_injury_model_fold{fold}.pth")
+
     for epoch in range(args.epochs):
-        print(f"Epoch {epoch + 1}/{args.epochs}")
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc, val_recall, val_prec, val_f1, val_auc = evaluate(model, val_loader, criterion, device)
-        print(f"  Train loss: {train_loss:.4f}  |  Val loss: {val_loss:.4f}  |  Val acc: {val_acc:.4f}  |  Val recall(pos): {val_recall:.4f}  |  Val prec(pos): {val_prec:.4f}  |  Val F1(pos): {val_f1:.4f}  |  Val AUC: {val_auc:.4f}")
+        lr_now = optimizer.param_groups[0]["lr"]
+
+        print(
+            f"  Ep {epoch + 1:>3}/{args.epochs}  "
+            f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+            f"acc={val_acc:.4f}  recall={val_recall:.4f}  "
+            f"prec={val_prec:.4f}  f1={val_f1:.4f}  auc={val_auc:.4f}  "
+            f"lr={lr_now:.2e}"
+        )
+
+        # Append to CSV log
+        if log_writer is not None:
+            log_writer.writerow({
+                "fold": fold,
+                "epoch": epoch + 1,
+                "train_loss": round(train_loss, 6),
+                "val_loss": round(val_loss, 6),
+                "val_acc": round(val_acc, 6),
+                "val_recall": round(val_recall, 6),
+                "val_precision": round(val_prec, 6),
+                "val_f1": round(val_f1, 6),
+                "val_auc": round(val_auc, 6),
+                "lr": lr_now,
+            })
+
+        scheduler.step(val_f1)
+
         if val_f1 > best_f1 + args.min_delta:
             best_f1 = val_f1
             best_epoch = epoch + 1
             epochs_no_improve = 0
-            torch.save(model.state_dict(), os.path.join(args.data_dir, 'best_bowel_injury_model.pth'))
-            print(f"  Saved new best model with F1 {best_f1:.4f} at epoch {best_epoch}")
+            best_metrics = {
+                "fold": fold, "best_epoch": best_epoch,
+                "val_acc": val_acc, "val_recall": val_recall,
+                "val_precision": val_prec, "val_f1": val_f1, "val_auc": val_auc,
+            }
+            torch.save(model.state_dict(), model_save_path)
+            print(f"  ✓ Saved best model → {model_save_path}  (F1={best_f1:.4f})")
         else:
             epochs_no_improve += 1
-            print(f"  No improvement in F1 for {epochs_no_improve}/{args.patience} epochs")
             if epochs_no_improve >= args.patience:
-                print(f"Early stopping triggered at epoch {epoch+1}. Best F1(pos)={best_f1:.4f} at epoch {best_epoch}")
+                print(f"  Early stop at epoch {epoch + 1}. Best F1={best_f1:.4f} @ epoch {best_epoch}")
                 break
 
+    if not best_metrics:
+        # No improvement at all; record last epoch metrics
+        best_metrics = {
+            "fold": fold, "best_epoch": 0,
+            "val_acc": val_acc, "val_recall": val_recall,
+            "val_precision": val_prec, "val_f1": val_f1, "val_auc": val_auc,
+        }
 
-if __name__ == '__main__':
+    return best_metrics
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a 2.5D bowel injury classifier on processed CT volumes.")
+    parser.add_argument("--data-dir", type=str, required=True, help="Directory containing .npy volumes and labels.csv")
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=7, help="Early stopping patience (epochs without F1 improvement)")
+    parser.add_argument("--min-delta", type=float, default=0.001, help="Min F1 improvement to reset patience")
+    parser.add_argument("--n-splits", type=int, default=5, help="Number of GroupKFold folds")
+    parser.add_argument("--fold", type=int, default=-1, help="Specific fold index to train (0-based). Default: -1 = all folds")
+    parser.add_argument("--num-steps", type=int, default=32)
+    parser.add_argument("--num-slices-per-step", type=int, default=3)
+    parser.add_argument("--cnn-name", type=str, default="resnet18", choices=["resnet18", "efficientnet_b0"])
+    parser.add_argument("--hidden-size", type=int, default=256)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--log-file", type=str, default="training_log.csv", help="CSV file for per-epoch metrics")
+    args = parser.parse_args()
+
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    device = torch.device(args.device)
+    print(f"Device: {device}")
+
+    train_folds, val_folds = prepare_splits(args.data_dir, n_splits=args.n_splits)
+
+    folds_to_run = list(range(len(train_folds))) if args.fold == -1 else [args.fold]
+
+    log_path = os.path.join(args.data_dir, args.log_file)
+    log_fields = ["fold", "epoch", "train_loss", "val_loss", "val_acc", "val_recall", "val_precision", "val_f1", "val_auc", "lr"]
+
+    all_results: list[dict] = []
+
+    with open(log_path, "w", newline="", encoding="utf-8") as log_f:
+        log_writer = csv.DictWriter(log_f, fieldnames=log_fields)
+        log_writer.writeheader()
+
+        for fold in folds_to_run:
+            result = _train_fold(
+                fold=fold,
+                train_df=train_folds[fold],
+                val_df=val_folds[fold],
+                args=args,
+                device=device,
+                log_writer=log_writer,
+            )
+            all_results.append(result)
+            log_f.flush()
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    print(f"\n{'=' * 60}")
+    print("CROSS-VALIDATION SUMMARY")
+    print("=" * 60)
+    header = f"{'Fold':>5}  {'BestEp':>6}  {'Acc':>7}  {'Recall':>7}  {'Prec':>7}  {'F1':>7}  {'AUC':>7}"
+    print(header)
+    print("-" * len(header))
+
+    metric_keys = ["val_acc", "val_recall", "val_precision", "val_f1", "val_auc"]
+    for r in all_results:
+        print(
+            f"{r['fold']:>5}  {r['best_epoch']:>6}  "
+            f"{r['val_acc']:>7.4f}  {r['val_recall']:>7.4f}  "
+            f"{r['val_precision']:>7.4f}  {r['val_f1']:>7.4f}  {r['val_auc']:>7.4f}"
+        )
+
+    if len(all_results) > 1:
+        print("-" * len(header))
+        for key, label in zip(metric_keys, ["Acc", "Recall", "Prec", "F1", "AUC"]):
+            vals = [r[key] for r in all_results]
+            mean = float(np.mean(vals))
+            std  = float(np.std(vals))
+            print(f"  {label}: {mean:.4f} ± {std:.4f}")
+
+    print(f"\nEpoch-level log saved → {log_path}")
+
+
+if __name__ == "__main__":
     main()

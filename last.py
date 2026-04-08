@@ -15,8 +15,10 @@ import zipfile
 import shutil
 import datetime
 import numpy as np
+import pandas as pd
 import streamlit as st
 import torch
+import torch.nn.functional as F
 import gdown
 import pydicom
 from scipy.ndimage import zoom
@@ -213,6 +215,15 @@ def load_dicom_series_from_bytes(dicom_bytes_list: list[bytes]) -> np.ndarray:
         raise ValueError(f"Only {len(dcm_list)} valid slices found (minimum 4 required)")
 
     def sort_key(d):
+        # Priority: Z-position (most accurate) → SliceLocation → InstanceNumber
+        try:
+            return float(d.ImagePositionPatient[2])
+        except Exception:
+            pass
+        try:
+            return float(d.SliceLocation)
+        except Exception:
+            pass
         return int(getattr(d, "InstanceNumber", 0))
     dcm_list.sort(key=sort_key)
 
@@ -337,25 +348,69 @@ def risk_bucket(prob: float, thresh: float) -> tuple[str, str, str]:
 
 
 # =========================
-# Saliency / Explainability
+# GradCAM Explainability
 # =========================
-def compute_saliency_map(model: torch.nn.Module, seq: torch.Tensor) -> np.ndarray:
-    """Compute gradient-based saliency map."""
-    inp = seq.to(DEVICE).clone().detach().requires_grad_(True)
-    model.zero_grad()
-    prob = torch.sigmoid(model(inp))
-    prob.backward()
+def compute_gradcam(model: torch.nn.Module, seq: torch.Tensor) -> np.ndarray:
+    """
+    Compute GradCAM heatmap for the most-attended time step.
 
-    if inp.grad is None:
-        return np.zeros((seq.shape[1], seq.shape[3], seq.shape[4]), dtype=np.float32)
+    Hooks onto the last conv layer of ResNet18 (model.cnn[-2] = layer4).
+    Returns a (T, H, W) array of normalized CAM values in [0, 1].
+    """
+    activations: dict = {}
+    gradients: dict = {}
 
-    sal = inp.grad.detach().abs().cpu().numpy()[0]  # (T, 3, H, W)
-    sal = np.nan_to_num(sal, nan=0.0, posinf=0.0, neginf=0.0)
-    sal_per_slice = sal.sum(axis=1)  # (T, H, W)
-    sal_max = sal_per_slice.max()
-    if sal_max > 0:
-        sal_per_slice = sal_per_slice / sal_max
-    return sal_per_slice
+    # Hook on layer4 (last spatial conv block of ResNet18)
+    target_layer = model.cnn[-2]
+
+    def fwd_hook(module, inp, out):
+        activations["value"] = out.detach()
+
+    def bwd_hook(module, grad_in, grad_out):
+        gradients["value"] = grad_out[0].detach()
+
+    fwd_handle = target_layer.register_forward_hook(fwd_hook)
+    bwd_handle = target_layer.register_full_backward_hook(bwd_hook)
+
+    try:
+        inp = seq.to(DEVICE)
+        model.zero_grad()
+
+        # Forward — keep graph for backward
+        logit = model(inp)
+        prob = torch.sigmoid(logit)
+        prob.backward()
+
+        acts = activations.get("value")   # (B*T, C, h, w)
+        grads = gradients.get("value")    # (B*T, C, h, w)
+
+        if acts is None or grads is None:
+            T, H, W = seq.shape[1], seq.shape[3], seq.shape[4]
+            return np.zeros((T, H, W), dtype=np.float32)
+
+        # Global average pool gradients → per-channel weights
+        weights = grads.mean(dim=(2, 3), keepdim=True)  # (B*T, C, 1, 1)
+        cam = (weights * acts).sum(dim=1)                # (B*T, h, w)
+        cam = F.relu(cam)
+
+        T = seq.shape[1]
+        H, W = seq.shape[3], seq.shape[4]
+
+        # Reshape to (T, h, w) and upsample to input resolution
+        cam = cam.unsqueeze(1)                                        # (T, 1, h, w)
+        cam = F.interpolate(cam, size=(H, W), mode="bilinear", align_corners=False)
+        cam = cam.squeeze(1).cpu().numpy()                            # (T, H, W)
+        cam = np.nan_to_num(cam, nan=0.0, posinf=0.0, neginf=0.0)
+
+        cam_max = cam.max()
+        if cam_max > 0:
+            cam = cam / cam_max
+
+        return cam.astype(np.float32)
+
+    finally:
+        fwd_handle.remove()
+        bwd_handle.remove()
 
 
 def describe_saliency_location(saliency_map: np.ndarray, percentile: float = 99.0, border: int = 10) -> str:
@@ -432,43 +487,47 @@ def apply_heatmap_overlay(base_slice: np.ndarray, saliency: np.ndarray, alpha: f
 
 
 def show_saliency_block(model: torch.nn.Module, seq: torch.Tensor, volume01: np.ndarray | None) -> None:
-    """Display saliency map analysis section."""
-    st.subheader("Saliency / Localization (Explainability)")
+    """Display GradCAM heatmap and overlay on CT slice."""
+    st.subheader("GradCAM — Model Attention Map")
     st.caption(
-        "Gradient-based saliency shows regions the model focused on. "
-        "This is NOT a direct lesion localization - interpret with clinical context."
+        "GradCAM highlights regions the model focused on when making its prediction. "
+        "Brighter = higher attention. This is NOT pixel-accurate lesion localization."
     )
 
-    with st.spinner("Computing saliency map..."):
-        saliency = compute_saliency_map(model, seq)
+    with st.spinner("Computing GradCAM..."):
+        cam = compute_gradcam(model, seq)   # (T, H, W)
 
-    T, H, W = saliency.shape
-    t_mid = T // 2
+    T, H, W = cam.shape
 
+    # Find the step with highest attention (most informative for display)
+    t_peak = int(cam.max(axis=(1, 2)).argmax())
+    t_mid  = T // 2
+
+    # Show peak and mid side-by-side
     colA, colB = st.columns(2)
     with colA:
-        sal_boost = vis_boost(saliency[t_mid])
-        st.image(sal_boost, caption=f"Saliency heatmap (step {t_mid})", clamp=True)
+        cam_vis = vis_boost(cam[t_peak], p_low=0.0, p_high=99.0, gamma=0.6)
+        st.image(cam_vis, caption=f"GradCAM — peak attention step {t_peak}", clamp=True)
     with colB:
         if isinstance(volume01, np.ndarray) and volume01.ndim == 3:
             z = volume01.shape[0]
-            z_idx = int(np.clip(round((t_mid / max(T - 1, 1)) * (z - 1)), 0, z - 1))
-            overlay = apply_heatmap_overlay(volume01[z_idx], saliency[t_mid])
-            st.image(overlay, caption=f"CT + saliency overlay (z={z_idx})")
+            z_idx = int(np.clip(round((t_peak / max(T - 1, 1)) * (z - 1)), 0, z - 1))
+            overlay = apply_heatmap_overlay(volume01[z_idx], cam[t_peak])
+            st.image(overlay, caption=f"CT slice z={z_idx} + GradCAM overlay")
 
             try:
                 buf = io.BytesIO()
                 Image.fromarray((overlay * 255).astype(np.uint8)).save(buf, format="PNG")
                 st.download_button(
-                    label="Download overlay image",
+                    label="Download GradCAM overlay",
                     data=buf.getvalue(),
-                    file_name=f"saliency_overlay_z{z_idx}.png",
+                    file_name=f"gradcam_overlay_z{z_idx}_step{t_peak}.png",
                     mime="image/png",
                 )
             except Exception:
                 pass
 
-    loc_desc = describe_saliency_location(saliency)
+    loc_desc = describe_saliency_location(cam)
     st.info(f"Model attention focused on: **{loc_desc}** region")
 
 
@@ -713,6 +772,9 @@ def page_prediction(model, threshold, num_steps, num_slices):
                 return
 
             vol01 = np.clip(vol.astype(np.float32), 0, 1)
+            # Apply same min/max normalization as training transform
+            v_min, v_max = vol01.min(), vol01.max()
+            vol01 = (vol01 - v_min) / (v_max - v_min + 1e-5)
             st.caption(f"Volume shape: {vol01.shape}, dtype: {vol.dtype}")
 
             mid = vol01.shape[0] // 2
@@ -793,6 +855,100 @@ def page_prediction(model, threshold, num_steps, num_slices):
 
             if st.checkbox("Show saliency map (explainability)", key="sal_zip"):
                 show_saliency_block(model, seq, volume01=vol.astype(np.float32))
+
+
+# =========================
+# Page: Batch Prediction
+# =========================
+def page_batch(model, threshold, num_steps, num_slices):
+    st.header("Batch Prediction")
+    st.info(
+        "Upload a ZIP file containing multiple `.npy` CT volumes. "
+        "Each `.npy` must be a float32 array with HU already windowed to [0, 1] "
+        "and shape `(D, H, W)`."
+    )
+
+    up = st.file_uploader(
+        "Upload ZIP containing .npy volumes", type=["zip"], key="batch_upload"
+    )
+    if not up:
+        return
+
+    zip_bytes = up.read()
+    # --- zip bomb guard ---
+    MAX_TOTAL_MB = 1000
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            npy_names = [n for n in zf.namelist() if n.lower().endswith(".npy") and not n.startswith("__")]
+            total_uncompressed = sum(info.file_size for info in zf.infolist())
+            if total_uncompressed > MAX_TOTAL_MB * 1024 * 1024:
+                st.error(f"ZIP uncompressed content exceeds {MAX_TOTAL_MB} MB limit.")
+                return
+            if not npy_names:
+                st.warning("No .npy files found in the ZIP.")
+                return
+            st.write(f"Found **{len(npy_names)}** .npy file(s). Running inference…")
+
+            results = []
+            progress = st.progress(0)
+            status_text = st.empty()
+
+            for idx, name in enumerate(npy_names):
+                status_text.text(f"Processing {name} ({idx + 1}/{len(npy_names)})…")
+                try:
+                    raw = zf.read(name)
+                    vol = np.load(io.BytesIO(raw))
+                    err = validate_npy_volume(vol)
+                    if err:
+                        results.append({"File": name, "Probability": None, "Risk Level": f"ERROR: {err}"})
+                        progress.progress((idx + 1) / len(npy_names))
+                        continue
+
+                    vol01 = np.clip(vol.astype(np.float32), 0, 1)
+                    v_min, v_max = vol01.min(), vol01.max()
+                    vol01 = (vol01 - v_min) / (v_max - v_min + 1e-5)
+
+                    seq = volume_to_sequence(vol01, num_steps=num_steps, num_slices_per_step=num_slices)
+                    prob = predict_prob_from_seq(model, seq)
+                    label, _, _ = risk_bucket(prob, threshold)
+                    results.append({"File": name, "Probability": round(float(prob), 4), "Risk Level": label})
+                except Exception as exc:
+                    results.append({"File": name, "Probability": None, "Risk Level": f"ERROR: {exc}"})
+
+                progress.progress((idx + 1) / len(npy_names))
+
+            status_text.text("Done.")
+    except zipfile.BadZipFile:
+        st.error("Invalid or corrupted ZIP file.")
+        return
+
+    if not results:
+        return
+
+    df = pd.DataFrame(results)
+    # colour risk level column
+    def _colour(val):
+        if isinstance(val, str):
+            if "HIGH" in val:
+                return "background-color:#7f1d1d; color:#fff"
+            if "MEDIUM" in val:
+                return "background-color:#78350f; color:#fff"
+            if "LOW" in val:
+                return "background-color:#14532d; color:#fff"
+        return ""
+
+    st.dataframe(
+        df.style.applymap(_colour, subset=["Risk Level"]),
+        use_container_width=True,
+    )
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download results as CSV",
+        data=csv_bytes,
+        file_name=f"batch_results_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv",
+        mime="text/csv",
+    )
 
 
 # =========================
@@ -922,7 +1078,7 @@ with st.sidebar:
 
     page = st.radio(
         "Menu",
-        ["AI Prediction", "Gallery", "Demo (Single Image)", "About"],
+        ["AI Prediction", "Batch Prediction", "Gallery", "Demo (Single Image)", "About"],
     )
 
 # Load model
@@ -942,6 +1098,8 @@ num_slices = int(num_slices_input)
 
 if page == "AI Prediction":
     page_prediction(model, threshold, num_steps, num_slices)
+elif page == "Batch Prediction":
+    page_batch(model, threshold, num_steps, num_slices)
 elif page == "Gallery":
     page_gallery()
 elif page == "Demo (Single Image)":
