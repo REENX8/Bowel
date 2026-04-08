@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import os
 import csv
-import math
+import sys
 import argparse
 from typing import List, Tuple
 
@@ -124,10 +124,11 @@ class BowelInjuryDataset(Dataset):
                 pre_pad = np.repeat(volume[[start]], pad_pre, axis=0) if pad_pre > 0 else np.empty((0, h, w))
                 post_pad = np.repeat(volume[[end - 1]], pad_post, axis=0) if pad_post > 0 else np.empty((0, h, w))
                 slc = np.concatenate([pre_pad, slc, post_pad], axis=0)
-            # Now slc has shape (num_slices_per_step, H, W)
-            if slc.shape[0] != self.num_slices_per_step:
-                # In case of edge cases
-                slc = np.resize(slc, (self.num_slices_per_step, h, w))
+            # Ensure exactly num_slices_per_step slices (edge-pad if short, trim if long)
+            if slc.shape[0] < self.num_slices_per_step:
+                pad_n = self.num_slices_per_step - slc.shape[0]
+                slc = np.concatenate([slc, np.repeat(slc[[-1]], pad_n, axis=0)], axis=0)
+            slc = slc[:self.num_slices_per_step]
             # Stack into channels
             frame = np.stack([slc[i] for i in range(self.num_slices_per_step)], axis=0)  # shape (3, H, W)
             frames.append(frame)
@@ -136,7 +137,10 @@ class BowelInjuryDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         row = self.df.iloc[idx]
-        volume = np.load(row['path'])  # shape (Z, H, W)
+        try:
+            volume = np.load(row['path'])  # shape (Z, H, W)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load volume '{row['path']}': {e}") from e
         seq = self._volume_to_sequence(volume)
         if self.transform:
             # Apply transform to each frame individually
@@ -328,7 +332,8 @@ def _train_fold(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-6, verbose=True
+        optimizer, mode="max", factor=args.lr_factor,
+        patience=args.lr_patience, min_lr=1e-6,
     )
 
     best_f1 = 0.0
@@ -408,6 +413,8 @@ def main() -> None:
     parser.add_argument("--num-slices-per-step", type=int, default=3)
     parser.add_argument("--cnn-name", type=str, default="resnet18", choices=["resnet18", "efficientnet_b0"])
     parser.add_argument("--hidden-size", type=int, default=256)
+    parser.add_argument("--lr-factor", type=float, default=0.5, help="Factor to reduce LR on plateau")
+    parser.add_argument("--lr-patience", type=int, default=3, help="Epochs to wait before reducing LR")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--log-file", type=str, default="training_log.csv", help="CSV file for per-epoch metrics")
     args = parser.parse_args()
@@ -420,7 +427,12 @@ def main() -> None:
 
     train_folds, val_folds = prepare_splits(args.data_dir, n_splits=args.n_splits)
 
-    folds_to_run = list(range(len(train_folds))) if args.fold == -1 else [args.fold]
+    if args.fold != -1:
+        if args.fold < 0 or args.fold >= len(train_folds):
+            sys.exit(f"Error: --fold must be in range [0, {len(train_folds) - 1}], got {args.fold}")
+        folds_to_run = [args.fold]
+    else:
+        folds_to_run = list(range(len(train_folds)))
 
     log_path = os.path.join(args.data_dir, args.log_file)
     log_fields = ["fold", "epoch", "train_loss", "val_loss", "val_acc", "val_recall", "val_precision", "val_f1", "val_auc", "lr"]

@@ -231,8 +231,14 @@ def load_dicom_series_from_bytes(dicom_bytes_list: list[bytes]) -> np.ndarray:
         [d.pixel_array.astype(np.int16) for d in dcm_list], axis=0
     ).astype(np.float32)
 
-    slope = float(getattr(dcm_list[0], "RescaleSlope", 1.0))
-    inter = float(getattr(dcm_list[0], "RescaleIntercept", 0.0))
+    try:
+        slope = float(getattr(dcm_list[0], "RescaleSlope", 1.0))
+    except (TypeError, ValueError):
+        slope = 1.0
+    try:
+        inter = float(getattr(dcm_list[0], "RescaleIntercept", 0.0))
+    except (TypeError, ValueError):
+        inter = 0.0
     return vol * slope + inter
 
 
@@ -357,6 +363,10 @@ def compute_gradcam(model: torch.nn.Module, seq: torch.Tensor) -> np.ndarray:
     Hooks onto the last conv layer of ResNet18 (model.cnn[-2] = layer4).
     Returns a (T, H, W) array of normalized CAM values in [0, 1].
     """
+    if seq.ndim != 5:
+        # Expected shape: (1, T, 3, H, W)
+        return np.zeros((1, 256, 256), dtype=np.float32)
+
     activations: dict = {}
     gradients: dict = {}
 
@@ -898,9 +908,9 @@ def page_batch(model, threshold, num_steps, num_slices):
                 try:
                     raw = zf.read(name)
                     vol = np.load(io.BytesIO(raw))
-                    err = validate_npy_volume(vol)
-                    if err:
-                        results.append({"File": name, "Probability": None, "Risk Level": f"ERROR: {err}"})
+                    valid, msg = validate_npy_volume(vol)
+                    if not valid:
+                        results.append({"File": name, "Probability": None, "Risk Level": f"ERROR: {msg}"})
                         progress.progress((idx + 1) / len(npy_names))
                         continue
 
@@ -938,7 +948,7 @@ def page_batch(model, threshold, num_steps, num_slices):
         return ""
 
     st.dataframe(
-        df.style.applymap(_colour, subset=["Risk Level"]),
+        df.style.map(_colour, subset=["Risk Level"]),
         use_container_width=True,
     )
 

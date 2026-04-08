@@ -58,8 +58,10 @@ python firstbowel_injury_model.py --data-dir /path/to/data --epochs 50
 ## File Structure
 
 ```
-last.py                   # Streamlit web app (inference)
-firstbowel_injury_model.py # Training script
+last.py                    # Streamlit web app (inference + batch prediction)
+firstbowel_injury_model.py # Training script (cross-fold, augmentation, CSV logging)
+preprocess.py              # DICOM folder → .npy pipeline
 requirements.txt           # Inference dependencies
 requirements-training.txt  # Training dependencies
+.devcontainer/             # GitHub Codespaces / Dev Container config
 ```

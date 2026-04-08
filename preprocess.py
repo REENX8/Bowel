@@ -87,9 +87,10 @@ def load_dicom_volume(patient_dir: Path) -> np.ndarray | None:
     Returns None if fewer than 2 valid DICOM files are found.
     """
     dcm_files = sorted(patient_dir.glob("**/*.dcm"))
+    dcm_files += sorted(patient_dir.glob("**/*.DCM"))
     if not dcm_files:
-        # try without extension
-        dcm_files = [p for p in patient_dir.rglob("*") if p.is_file()]
+        print(f"  Warning: No .dcm/.DCM files found in {patient_dir}")
+        return None
 
     datasets = []
     for f in dcm_files:
@@ -98,7 +99,8 @@ def load_dicom_volume(patient_dir: Path) -> np.ndarray | None:
             if not hasattr(ds, "pixel_array"):
                 continue
             datasets.append(ds)
-        except Exception:
+        except Exception as e:
+            print(f"  Warning: Skipping {f.name}: {e}")
             continue
 
     if len(datasets) < 2:
@@ -111,8 +113,14 @@ def load_dicom_volume(patient_dir: Path) -> np.ndarray | None:
         try:
             arr = ds.pixel_array.astype(np.float32)
             # Apply RescaleSlope / RescaleIntercept to convert to HU
-            slope = float(getattr(ds, "RescaleSlope", 1))
-            intercept = float(getattr(ds, "RescaleIntercept", 0))
+            try:
+                slope = float(getattr(ds, "RescaleSlope", 1))
+            except (TypeError, ValueError):
+                slope = 1.0
+            try:
+                intercept = float(getattr(ds, "RescaleIntercept", 0))
+            except (TypeError, ValueError):
+                intercept = 0.0
             arr = arr * slope + intercept
         except Exception:
             continue
